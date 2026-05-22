@@ -207,19 +207,56 @@ fn cmd_watch(dir: &Path) -> anyhow::Result<()> {
 
     watcher.watch(dir, RecursiveMode::NonRecursive)?;
 
-    // 先处理已有文件
     let mut state = load_state();
+
+    // 去重：记录已处理的文件（规范化路径）
+    let mut processed: HashMap<PathBuf, std::time::Instant> = HashMap::new();
+    let debounce = Duration::from_millis(500);
+
+    // 过滤不应处理的文件
+    fn should_skip(path: &Path) -> bool {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .map(|name| {
+                name.starts_with('.')      // 隐藏文件
+                || name.ends_with(".part")  // 部分下载
+                || name.ends_with(".tmp")   // 临时文件
+                || name.ends_with(".crdownload") // Chrome 下载中
+            })
+            .unwrap_or(true)
+    }
+
+    // 尝试处理一个文件路径
+    let try_process = |path: &Path, state: &mut State, processed: &mut HashMap<PathBuf, std::time::Instant>| {
+        if !path.is_file() || should_skip(path) {
+            return;
+        }
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let now = std::time::Instant::now();
+
+        // 如果最近处理过这个文件，跳过
+        if let Some(last) = processed.get(&canonical) {
+            if now.duration_since(*last) < debounce {
+                return;
+            }
+        }
+
+        if let Err(e) = copy_to_shared(path, state) {
+            eprintln!("✗ {}: {}", path.display(), e);
+        }
+        processed.insert(canonical, now);
+        save_state(state);
+    };
+
+    // 先处理已有文件
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_file() {
-                if let Err(e) = copy_to_shared(&path, &mut state) {
-                    eprintln!("✗ {}: {}", path.display(), e);
-                }
+            if path.is_file() && !should_skip(&path) {
+                try_process(&path, &mut state, &mut processed);
             }
         }
     }
-    save_state(&state);
 
     // 持续监听
     loop {
@@ -227,24 +264,18 @@ fn cmd_watch(dir: &Path) -> anyhow::Result<()> {
             Ok(event) => match event.kind {
                 EventKind::Create(_) | EventKind::Modify(_) => {
                     for path in &event.paths {
-                        if path.is_file() {
-                            std::thread::sleep(Duration::from_millis(200));
-                            if path.exists() && path.is_file() {
-                                if let Err(e) = copy_to_shared(path, &mut state) {
-                                    eprintln!("✗ {}: {}", path.display(), e);
-                                }
-                                save_state(&state);
-                            }
+                        // 等文件写完再处理
+                        std::thread::sleep(Duration::from_millis(300));
+                        if path.exists() {
+                            try_process(path, &mut state, &mut processed);
                         }
                     }
                 }
                 _ => {}
             },
-            Err(_) => break,
+            Err(_) => break Ok(()),
         }
     }
-
-    Ok(())
 }
 
 fn cmd_list() -> anyhow::Result<()> {
