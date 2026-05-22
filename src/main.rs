@@ -310,9 +310,6 @@ fn cmd_clean(all: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ============================================================
-// Main
-// ============================================================
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -326,5 +323,207 @@ fn main() -> anyhow::Result<()> {
         Command::Watch { dir } => cmd_watch(&dir),
         Command::List => cmd_list(),
         Command::Clean { all } => cmd_clean(all),
+    }
+}
+
+// ============================================================
+// Tests
+// ============================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_test_env<F>(test_fn: F)
+    where
+        F: FnOnce(&Path, &Path),
+    {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("webox-test-{}", std::process::id()));
+
+        let config = tmp.join("config");
+        let data = tmp.join("data");
+
+        fs::create_dir_all(&config).ok();
+        fs::create_dir_all(&data).ok();
+
+        env::set_var("XDG_CONFIG_HOME", &config);
+        env::set_var("XDG_DATA_HOME", &data);
+
+        test_fn(&config, &data);
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_copy_to_shared() {
+        with_test_env(|_config, _data| {
+            let source = PathBuf::from("/tmp/webox-test-source.txt");
+            fs::write(&source, "hello").unwrap();
+
+            let mut state = State {
+                files: HashMap::new(),
+            };
+
+            let dest = copy_to_shared(&source, &mut state).unwrap();
+            assert!(dest.exists());
+            assert_eq!(fs::read_to_string(&dest).unwrap(), "hello");
+            assert_eq!(state.files.len(), 1);
+            assert!(dest.starts_with(shared_dir()));
+
+            fs::remove_file(&source).ok();
+        });
+    }
+
+    #[test]
+    fn test_state_persistence() {
+        with_test_env(|_config, _data| {
+            let mut state = State {
+                files: HashMap::new(),
+            };
+            state.files.insert(
+                "test.txt".into(),
+                FileEntry {
+                    original_name: "test.txt".into(),
+                    copied_at: Local::now(),
+                    source: PathBuf::from("/tmp/test.txt"),
+                },
+            );
+
+            save_state(&state);
+            assert!(state_path().exists());
+
+            let loaded = load_state();
+            assert_eq!(loaded.files.len(), 1);
+            assert!(loaded.files.contains_key("test.txt"));
+        });
+    }
+
+    #[test]
+    fn test_empty_state_on_start() {
+        with_test_env(|_config, _data| {
+            let state = load_state();
+            assert!(state.files.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_duplicate_filename_handling() {
+        with_test_env(|_config, _data| {
+            let shared = shared_dir();
+            fs::create_dir_all(&shared).unwrap();
+            fs::write(shared.join("dup.txt"), "existing").unwrap();
+
+            let source = PathBuf::from("/tmp/dup.txt");
+            fs::write(&source, "new content").unwrap();
+
+            let mut state = State {
+                files: HashMap::new(),
+            };
+
+            let dest = copy_to_shared(&source, &mut state).unwrap();
+
+            let name = dest.file_name().unwrap().to_str().unwrap();
+            assert!(name.starts_with("dup_"));
+            assert_ne!(name, "dup.txt");
+            assert_eq!(fs::read_to_string(&dest).unwrap(), "new content");
+            assert_eq!(
+                fs::read_to_string(shared.join("dup.txt")).unwrap(),
+                "existing"
+            );
+
+            fs::remove_file(&source).ok();
+        });
+    }
+
+    #[test]
+    fn test_copy_nonexistent_file_fails() {
+        with_test_env(|_config, _data| {
+            let mut state = State {
+                files: HashMap::new(),
+            };
+            let result =
+                copy_to_shared(&PathBuf::from("/tmp/does-not-exist-xyz.txt"), &mut state);
+            assert!(result.is_err());
+            assert_eq!(state.files.len(), 0);
+        });
+    }
+
+    #[test]
+    fn test_copy_directory_fails() {
+        with_test_env(|_config, _data| {
+            let dir = PathBuf::from("/tmp/webox-test-dir");
+            fs::create_dir_all(&dir).unwrap();
+            let mut state = State {
+                files: HashMap::new(),
+            };
+            let result = copy_to_shared(&dir, &mut state);
+            assert!(result.is_err());
+            fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    #[test]
+    fn test_clean_removes_files() {
+        with_test_env(|_config, _data| {
+            let shared = shared_dir();
+            fs::create_dir_all(&shared).unwrap();
+            let file = shared.join("clean-test.txt");
+            fs::write(&file, "data").unwrap();
+
+            let mut state = State {
+                files: HashMap::new(),
+            };
+            state.files.insert(
+                "clean-test.txt".into(),
+                FileEntry {
+                    original_name: "clean-test.txt".into(),
+                    copied_at: Local::now(),
+                    source: PathBuf::from("/tmp/clean-test.txt"),
+                },
+            );
+            save_state(&state);
+
+            cmd_clean(false).unwrap();
+
+            assert!(!file.exists());
+            let loaded = load_state();
+            assert!(loaded.files.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_clean_nothing_is_ok() {
+        with_test_env(|_config, _data| {
+            assert!(cmd_clean(false).is_ok());
+        });
+    }
+
+    #[test]
+    fn test_list_with_no_files() {
+        with_test_env(|_config, _data| {
+            assert!(cmd_list().is_ok());
+        });
+    }
+
+    #[test]
+    fn test_send_multiple_files() {
+        with_test_env(|_config, _data| {
+            let f1 = PathBuf::from("/tmp/webox-test-a.txt");
+            let f2 = PathBuf::from("/tmp/webox-test-b.txt");
+            fs::write(&f1, "a").unwrap();
+            fs::write(&f2, "b").unwrap();
+
+            cmd_send(&[f1.clone(), f2.clone()]).unwrap();
+
+            let state = load_state();
+            assert_eq!(state.files.len(), 2);
+
+            fs::remove_file(&f1).ok();
+            fs::remove_file(&f2).ok();
+        });
     }
 }
