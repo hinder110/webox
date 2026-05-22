@@ -1,0 +1,330 @@
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::Duration;
+
+use chrono::{DateTime, Local};
+use clap::{Parser, Subcommand};
+use notify::{Event, EventKind, RecursiveMode, Watcher};
+use serde::{Deserialize, Serialize};
+
+// ============================================================
+// CLI
+// ============================================================
+#[derive(Parser)]
+#[command(name = "webox", about = "微信文件共享助手")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// 一次性复制文件到微信 Shared 目录
+    Send {
+        /// 要发送的文件路径
+        paths: Vec<PathBuf>,
+    },
+    /// 监听目录，新文件自动复制到微信 Shared
+    Watch {
+        /// 要监听的目录
+        dir: PathBuf,
+    },
+    /// 列出已共享的文件
+    List,
+    /// 清理 Shared 中的文件（默认只清理 webox 管理的）
+    Clean {
+        /// 清理 Shared 目录里的所有文件
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+// ============================================================
+// State
+// ============================================================
+#[derive(Debug, Serialize, Deserialize)]
+struct State {
+    files: HashMap<String, FileEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FileEntry {
+    original_name: String,
+    copied_at: DateTime<Local>,
+    source: PathBuf,
+}
+
+fn state_path() -> PathBuf {
+    config_dir().join("webox").join("state.json")
+}
+
+fn shared_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("WEBOX_SHARED_DIR") {
+        return PathBuf::from(dir);
+    }
+    data_dir().join("WeChat_Data").join("Shared")
+}
+
+fn config_dir() -> PathBuf {
+    std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home_dir().join(".config"))
+}
+
+fn data_dir() -> PathBuf {
+    std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home_dir().join(".local").join("share"))
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+}
+
+fn load_state() -> State {
+    let path = state_path();
+    if path.exists() {
+        fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| State {
+                files: HashMap::new(),
+            })
+    } else {
+        State {
+            files: HashMap::new(),
+        }
+    }
+}
+
+fn save_state(state: &State) {
+    let path = state_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).ok();
+    }
+    if let Ok(json) = serde_json::to_string_pretty(state) {
+        fs::write(&path, json).ok();
+    }
+}
+
+// ============================================================
+// Operations
+// ============================================================
+
+fn copy_to_shared(source: &Path, state: &mut State) -> anyhow::Result<PathBuf> {
+    if !source.exists() {
+        anyhow::bail!("文件不存在: {}", source.display());
+    }
+    if !source.is_file() {
+        anyhow::bail!("不是文件: {}", source.display());
+    }
+
+    let shared = shared_dir();
+    fs::create_dir_all(&shared)?;
+
+    let original_name = source
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+
+    // 处理重名
+    let mut dest = shared.join(original_name);
+    let mut counter = 1;
+    while dest.exists() {
+        let stem = Path::new(original_name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file");
+        let ext = Path::new(original_name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| format!(".{}", e))
+            .unwrap_or_default();
+        dest = shared.join(format!("{}_{}{}", stem, counter, ext));
+        counter += 1;
+    }
+
+    fs::copy(source, &dest)?;
+
+    let key = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    println!("✓ 已共享: {}", dest.display());
+
+    state.files.insert(
+        key,
+        FileEntry {
+            original_name: original_name.to_string(),
+            copied_at: Local::now(),
+            source: source.to_path_buf(),
+        },
+    );
+
+    Ok(dest)
+}
+
+fn cmd_send(paths: &[PathBuf]) -> anyhow::Result<()> {
+    let mut state = load_state();
+    for path in paths {
+        match copy_to_shared(path, &mut state) {
+            Ok(_) => {}
+            Err(e) => eprintln!("✗ {}: {}", path.display(), e),
+        }
+    }
+    save_state(&state);
+    Ok(())
+}
+
+fn cmd_watch(dir: &Path) -> anyhow::Result<()> {
+    if !dir.exists() {
+        fs::create_dir_all(dir)?;
+        println!("已创建监听目录: {}", dir.display());
+    }
+    if !dir.is_dir() {
+        anyhow::bail!("不是目录: {}", dir.display());
+    }
+
+    let shared = shared_dir();
+    fs::create_dir_all(&shared)?;
+
+    println!("👁  监听中: {} → {}", dir.display(), shared.display());
+    println!("   拖文件进来就会自动共享。Ctrl+C 停止。");
+
+    let (tx, rx) = mpsc::channel();
+
+    let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+        if let Ok(event) = res {
+            tx.send(event).ok();
+        }
+    })?;
+
+    watcher.watch(dir, RecursiveMode::NonRecursive)?;
+
+    // 先处理已有文件
+    let mut state = load_state();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Err(e) = copy_to_shared(&path, &mut state) {
+                    eprintln!("✗ {}: {}", path.display(), e);
+                }
+            }
+        }
+    }
+    save_state(&state);
+
+    // 持续监听
+    loop {
+        match rx.recv() {
+            Ok(event) => match event.kind {
+                EventKind::Create(_) | EventKind::Modify(_) => {
+                    for path in &event.paths {
+                        if path.is_file() {
+                            std::thread::sleep(Duration::from_millis(200));
+                            if path.exists() && path.is_file() {
+                                if let Err(e) = copy_to_shared(path, &mut state) {
+                                    eprintln!("✗ {}: {}", path.display(), e);
+                                }
+                                save_state(&state);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Err(_) => break,
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_list() -> anyhow::Result<()> {
+    let state = load_state();
+    if state.files.is_empty() {
+        println!("暂无共享文件");
+        return Ok(());
+    }
+
+    println!("已共享文件 ({} 个):", state.files.len());
+    println!("{:<40} {:<20} {:<}", "文件名", "时间", "来源");
+    println!("{}", "-".repeat(80));
+
+    let mut entries: Vec<_> = state.files.iter().collect();
+    entries.sort_by(|a, b| b.1.copied_at.cmp(&a.1.copied_at));
+
+    for (name, entry) in entries {
+        println!(
+            "{:<40} {:<20} {:<}",
+            name,
+            entry.copied_at.format("%Y-%m-%d %H:%M"),
+            entry.source.display()
+        );
+    }
+    Ok(())
+}
+
+fn cmd_clean(all: bool) -> anyhow::Result<()> {
+    let mut state = load_state();
+    let shared = shared_dir();
+
+    if all {
+        let count = state.files.len();
+        let mut removed = 0;
+        for name in state.files.keys() {
+            let path = shared.join(name);
+            if path.exists() {
+                fs::remove_file(&path)?;
+                removed += 1;
+            }
+        }
+        state.files.clear();
+        save_state(&state);
+        println!("✓ 已清理 {} 个文件（追踪 {} 个，实际删除 {} 个）", count, count, removed);
+    } else {
+        if state.files.is_empty() {
+            println!("没有需要清理的文件");
+            return Ok(());
+        }
+        let mut removed = 0;
+        for name in state.files.keys() {
+            let path = shared.join(name);
+            if path.exists() {
+                fs::remove_file(&path)?;
+                removed += 1;
+            }
+        }
+        let count = state.files.len();
+        state.files.clear();
+        save_state(&state);
+        println!("✓ 已清理 {} 个文件（实际删除 {} 个）", count, removed);
+    }
+    Ok(())
+}
+
+// ============================================================
+// Main
+// ============================================================
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Command::Send { paths } => {
+            if paths.is_empty() {
+                anyhow::bail!("请指定要发送的文件路径");
+            }
+            cmd_send(&paths)
+        }
+        Command::Watch { dir } => cmd_watch(&dir),
+        Command::List => cmd_list(),
+        Command::Clean { all } => cmd_clean(all),
+    }
+}
