@@ -226,6 +226,26 @@ fn cmd_watch(dir: &Path) -> anyhow::Result<()> {
             .unwrap_or(true)
     }
 
+    // 等待文件写完（大小稳定）
+    fn wait_file_ready(path: &Path, max_wait: Duration) -> bool {
+        let start = std::time::Instant::now();
+        let mut last_size = None;
+        while start.elapsed() < max_wait {
+            match fs::metadata(path) {
+                Ok(meta) => {
+                    let size = meta.len();
+                    if Some(size) == last_size {
+                        return true;
+                    }
+                    last_size = Some(size);
+                }
+                Err(_) => return false,
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
     // 尝试处理一个文件路径
     let try_process = |path: &Path, state: &mut State, processed: &mut HashMap<PathBuf, std::time::Instant>| {
         if !path.is_file() || should_skip(path) {
@@ -239,6 +259,11 @@ fn cmd_watch(dir: &Path) -> anyhow::Result<()> {
             if now.duration_since(*last) < debounce {
                 return;
             }
+        }
+
+        if !wait_file_ready(path, Duration::from_millis(2000)) {
+            eprintln!("✗ {}: 文件未就绪", path.display());
+            return;
         }
 
         if let Err(e) = copy_to_shared(path, state) {
@@ -264,8 +289,6 @@ fn cmd_watch(dir: &Path) -> anyhow::Result<()> {
             Ok(event) => match event.kind {
                 EventKind::Create(_) | EventKind::Modify(_) => {
                     for path in &event.paths {
-                        // 等文件写完再处理
-                        std::thread::sleep(Duration::from_millis(300));
                         if path.exists() {
                             try_process(path, &mut state, &mut processed);
                         }
