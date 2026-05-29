@@ -7,6 +7,7 @@ use std::time::Duration;
 use chrono::{DateTime, Local};
 use clap::{Parser, Subcommand};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
+use notify::event::ModifyKind;
 use serde::{Deserialize, Serialize};
 
 // ============================================================
@@ -44,7 +45,7 @@ enum Command {
 // ============================================================
 // State
 // ============================================================
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct State {
     files: HashMap<String, FileEntry>,
 }
@@ -88,16 +89,18 @@ fn home_dir() -> PathBuf {
 fn load_state() -> State {
     let path = state_path();
     if path.exists() {
-        fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_else(|| State {
-                files: HashMap::new(),
-            })
-    } else {
-        State {
-            files: HashMap::new(),
+        match fs::read_to_string(&path) {
+            Ok(content) => match serde_json::from_str(&content) {
+                Ok(state) => state,
+                Err(_) => {
+                    eprintln!("⚠ state.json 已损坏，已重置为空状态");
+                    State::default()
+                }
+            },
+            Err(_) => State::default(),
         }
+    } else {
+        State::default()
     }
 }
 
@@ -121,6 +124,17 @@ fn copy_to_shared(source: &Path, state: &mut State) -> anyhow::Result<PathBuf> {
     }
     if !source.is_file() {
         anyhow::bail!("不是文件: {}", source.display());
+    }
+
+    // 去重：如果该源文件已复制过，直接返回已有路径
+    for (name, entry) in &state.files {
+        if entry.source == source {
+            let dest = shared_dir().join(name);
+            if dest.exists() {
+                println!("✓ 已存在: {}", dest.display());
+                return Ok(dest);
+            }
+        }
     }
 
     let shared = shared_dir();
@@ -172,14 +186,102 @@ fn copy_to_shared(source: &Path, state: &mut State) -> anyhow::Result<PathBuf> {
 
 fn cmd_send(paths: &[PathBuf]) -> anyhow::Result<()> {
     let mut state = load_state();
+    let total = paths.len();
+    let mut success = 0usize;
     for path in paths {
         match copy_to_shared(path, &mut state) {
-            Ok(_) => {}
+            Ok(_) => success += 1,
             Err(e) => eprintln!("✗ {}: {}", path.display(), e),
         }
     }
     save_state(&state);
+    let failed = total - success;
+    println!("已完成: {}, 失败: {}", success, failed);
     Ok(())
+}
+
+/// Returns true if an event kind should trigger file processing.
+/// Filters out metadata-only modifications.
+fn event_should_process(kind: &EventKind) -> bool {
+    match kind {
+        EventKind::Create(_) => true,
+        EventKind::Modify(ModifyKind::Data(_)) => true,
+        _ => false,
+    }
+}
+
+fn should_skip(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|name| {
+            name.starts_with('.')      // 隐藏文件
+            || name.ends_with(".part")  // 部分下载
+            || name.ends_with(".tmp")   // 临时文件
+            || name.ends_with(".crdownload") // Chrome 下载中
+        })
+        .unwrap_or(true)
+}
+
+fn wait_file_ready(path: &Path, max_wait: Duration) -> bool {
+    let start = std::time::Instant::now();
+    let mut last_size = None;
+    while start.elapsed() < max_wait {
+        match fs::metadata(path) {
+            Ok(meta) => {
+                let size = meta.len();
+                if Some(size) == last_size {
+                    return true;
+                }
+                last_size = Some(size);
+            }
+            Err(_) => return false,
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+fn cleanup_processed(processed: &mut HashMap<PathBuf, std::time::Instant>, max_age: Duration) {
+    let cutoff = std::time::Instant::now() - max_age;
+    processed.retain(|_, time| *time > cutoff);
+}
+
+fn process_file(
+    path: &Path,
+    state: &mut State,
+    processed: &mut HashMap<PathBuf, std::time::Instant>,
+    debounce: Duration,
+) {
+    if !path.is_file() || should_skip(path) {
+        return;
+    }
+    let canonical = match path.canonicalize() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let now = std::time::Instant::now();
+
+    if let Some(last) = processed.get(&canonical) {
+        if now.duration_since(*last) < debounce {
+            return;
+        }
+    }
+
+    if !wait_file_ready(path, Duration::from_millis(2000)) {
+        eprintln!("✗ {}: 文件未就绪", path.display());
+        return;
+    }
+
+    match copy_to_shared(path, state) {
+        Ok(_) => {
+            cleanup_processed(processed, Duration::from_secs(300));
+            processed.insert(canonical, now);
+            save_state(state);
+        }
+        Err(e) => {
+            eprintln!("✗ {}: {}", path.display(), e);
+        }
+    }
 }
 
 fn cmd_watch(dir: &Path) -> anyhow::Result<()> {
@@ -213,64 +315,9 @@ fn cmd_watch(dir: &Path) -> anyhow::Result<()> {
     let mut processed: HashMap<PathBuf, std::time::Instant> = HashMap::new();
     let debounce = Duration::from_millis(500);
 
-    // 过滤不应处理的文件
-    fn should_skip(path: &Path) -> bool {
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .map(|name| {
-                name.starts_with('.')      // 隐藏文件
-                || name.ends_with(".part")  // 部分下载
-                || name.ends_with(".tmp")   // 临时文件
-                || name.ends_with(".crdownload") // Chrome 下载中
-            })
-            .unwrap_or(true)
-    }
-
-    // 等待文件写完（大小稳定）
-    fn wait_file_ready(path: &Path, max_wait: Duration) -> bool {
-        let start = std::time::Instant::now();
-        let mut last_size = None;
-        while start.elapsed() < max_wait {
-            match fs::metadata(path) {
-                Ok(meta) => {
-                    let size = meta.len();
-                    if Some(size) == last_size {
-                        return true;
-                    }
-                    last_size = Some(size);
-                }
-                Err(_) => return false,
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        false
-    }
-
     // 尝试处理一个文件路径
     let try_process = |path: &Path, state: &mut State, processed: &mut HashMap<PathBuf, std::time::Instant>| {
-        if !path.is_file() || should_skip(path) {
-            return;
-        }
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let now = std::time::Instant::now();
-
-        // 如果最近处理过这个文件，跳过
-        if let Some(last) = processed.get(&canonical) {
-            if now.duration_since(*last) < debounce {
-                return;
-            }
-        }
-
-        if !wait_file_ready(path, Duration::from_millis(2000)) {
-            eprintln!("✗ {}: 文件未就绪", path.display());
-            return;
-        }
-
-        if let Err(e) = copy_to_shared(path, state) {
-            eprintln!("✗ {}: {}", path.display(), e);
-        }
-        processed.insert(canonical, now);
-        save_state(state);
+        process_file(path, state, processed, debounce)
     };
 
     // 先处理已有文件
@@ -287,7 +334,7 @@ fn cmd_watch(dir: &Path) -> anyhow::Result<()> {
     loop {
         match rx.recv() {
             Ok(event) => match event.kind {
-                EventKind::Create(_) | EventKind::Modify(_) => {
+                kind if event_should_process(&kind) => {
                     for path in &event.paths {
                         if path.exists() {
                             try_process(path, &mut state, &mut processed);
@@ -388,6 +435,98 @@ mod tests {
     use super::*;
     use std::env;
     use std::sync::Mutex;
+    use notify::event::{DataChange, MetadataKind, CreateKind};
+
+    #[test]
+    fn test_process_file_skips_when_cannot_canonicalize() {
+        with_test_env(|_config, _data| {
+            let file = PathBuf::from("/tmp/webox-bug5-test.txt");
+            fs::write(&file, "hello").unwrap();
+            fs::remove_file(&file).unwrap();
+
+            let mut state2 = State { files: HashMap::new() };
+            let mut processed2: HashMap<PathBuf, std::time::Instant> = HashMap::new();
+            process_file(&file, &mut state2, &mut processed2, Duration::from_millis(500));
+            assert!(state2.files.is_empty(), "should not process when canonicalize fails");
+            assert!(processed2.is_empty(), "processed should remain empty");
+        });
+    }
+
+    #[test]
+    fn test_processed_cleanup_removes_stale_entries() {
+        let mut processed: HashMap<PathBuf, std::time::Instant> = HashMap::new();
+        let old_path = PathBuf::from("/tmp/old-file.txt");
+        let new_path = PathBuf::from("/tmp/new-file.txt");
+
+        processed.insert(old_path.clone(), std::time::Instant::now() - Duration::from_secs(360));
+        processed.insert(new_path.clone(), std::time::Instant::now());
+
+        cleanup_processed(&mut processed, Duration::from_secs(300));
+
+        assert!(!processed.contains_key(&old_path), "old entries should be removed");
+        assert!(processed.contains_key(&new_path), "new entries should remain");
+    }
+
+    #[test]
+    fn test_save_state_not_called_on_failed_copy() {
+        with_test_env(|_config, _data| {
+            let source = PathBuf::from("/tmp/webox-bug7-copy-fail.txt");
+            let _ = fs::remove_file(&source);
+            fs::write(&source, "data").unwrap();
+
+            let mut state = State { files: HashMap::new() };
+            let mut processed: HashMap<PathBuf, std::time::Instant> = HashMap::new();
+
+            // Make source unreadable so fs::copy fails
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = fs::metadata(&source).unwrap().permissions();
+                perms.set_mode(0o000);
+                fs::set_permissions(&source, perms).unwrap();
+            }
+
+            process_file(&source, &mut state, &mut processed, Duration::from_millis(500));
+
+            // State and processed should remain unchanged when copy fails
+            assert!(state.files.is_empty(), "state should not be modified on failed copy");
+            assert!(processed.is_empty(), "processed should not be modified on failed copy");
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(perms) = fs::metadata(&source).map(|m| m.permissions()) {
+                    let mut p = perms;
+                    p.set_mode(0o644);
+                    fs::set_permissions(&source, p).ok();
+                }
+            }
+            fs::remove_file(&source).ok();
+        });
+    }
+
+    #[test]
+    fn test_canonicalize_returns_none_for_nonexistent() {
+        let missing = PathBuf::from("/tmp/webox-nonexistent-canon-test.txt");
+        assert!(fs::canonicalize(&missing).is_err());
+    }
+
+    #[test]
+    fn test_event_should_process_filters_metadata_modify() {
+        // Metadata modifications should NOT be processed
+        assert!(!event_should_process(&EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any))));
+        assert!(!event_should_process(&EventKind::Modify(ModifyKind::Metadata(MetadataKind::WriteTime))));
+        assert!(!event_should_process(&EventKind::Modify(ModifyKind::Any)));
+        assert!(!event_should_process(&EventKind::Modify(ModifyKind::Other)));
+
+        // Data content modifications SHOULD be processed
+        assert!(event_should_process(&EventKind::Modify(ModifyKind::Data(DataChange::Content))));
+        assert!(event_should_process(&EventKind::Modify(ModifyKind::Data(DataChange::Any))));
+        assert!(event_should_process(&EventKind::Modify(ModifyKind::Data(DataChange::Size))));
+
+        // Create events SHOULD be processed
+        assert!(event_should_process(&EventKind::Create(CreateKind::Any)));
+    }
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -461,6 +600,75 @@ mod tests {
         with_test_env(|_config, _data| {
             let state = load_state();
             assert!(state.files.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_corrupted_state_warns_and_resets() {
+        with_test_env(|config, data| {
+            let path = state_path();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "{{{corrupted}}}").unwrap();
+
+            // (a) returns empty state
+            let state = load_state();
+            assert!(state.files.is_empty());
+
+            // (b) warning is printed to stderr
+            let exe = std::env::current_exe().unwrap();
+            let output = std::process::Command::new(&exe)
+                .args(["--nocapture", "--", "corrupted_state_stderr_check"])
+                .env("XDG_CONFIG_HOME", config)
+                .env("XDG_DATA_HOME", data)
+                .output()
+                .unwrap();
+
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "child test failed:\nstderr: {stderr}",
+            );
+            assert!(
+                stderr.contains("已损坏"),
+                "expected warning on stderr, got: {stderr:?}",
+            );
+        });
+    }
+
+    /// Helper test called as subprocess by test_corrupted_state_warns_and_resets.
+    /// Expects XDG_CONFIG_HOME / XDG_DATA_HOME to point at a corrupted state dir.
+    #[test]
+    fn corrupted_state_stderr_check() {
+        if std::env::var("XDG_CONFIG_HOME").is_err() {
+            eprintln!("SKIP: not invoked via subprocess");
+            return;
+        }
+        // Should produce eprintln! warning when corrupted file is present
+        load_state();
+    }
+
+    #[test]
+    fn test_send_duplicate_source_skips_copy() {
+        with_test_env(|_config, _data| {
+            let source = PathBuf::from("/tmp/webox-test-dup-src.txt");
+            fs::write(&source, "hello").unwrap();
+
+            let mut state = State { files: HashMap::new() };
+
+            let dest1 = copy_to_shared(&source, &mut state).unwrap();
+            assert!(dest1.exists());
+            assert_eq!(state.files.len(), 1);
+
+            let dest2 = copy_to_shared(&source, &mut state).unwrap();
+            assert_eq!(dest2, dest1, "duplicate send should return same path");
+            assert_eq!(state.files.len(), 1, "duplicate send should not add another entry");
+            assert!(dest2.exists(), "dest should still exist");
+
+            let shared = shared_dir();
+            let entries: Vec<_> = fs::read_dir(&shared).unwrap().collect();
+            assert_eq!(entries.len(), 1, "only one file should exist in shared dir");
+
+            fs::remove_file(&source).ok();
         });
     }
 
@@ -561,6 +769,50 @@ mod tests {
         with_test_env(|_config, _data| {
             assert!(cmd_list().is_ok());
         });
+    }
+
+    #[test]
+    fn test_send_reports_summary() {
+        with_test_env(|config, data| {
+            let valid = PathBuf::from("/tmp/webox-test-summary-valid.txt");
+            fs::write(&valid, "content").unwrap();
+
+            let exe = std::env::current_exe().unwrap();
+            let output = std::process::Command::new(&exe)
+                .args(["--nocapture", "--", "send_summary_subprocess_check"])
+                .env("XDG_CONFIG_HOME", config)
+                .env("XDG_DATA_HOME", data)
+                .output()
+                .unwrap();
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "child test failed:\nstdout: {stdout}\nstderr: {stderr}",
+            );
+            assert!(
+                stdout.contains("已完成: 1, 失败: 1"),
+                "expected summary in stdout, got: {stdout:?}",
+            );
+            assert!(
+                stderr.contains("✗"),
+                "expected file-not-found error on stderr, got: {stderr:?}",
+            );
+
+            fs::remove_file(&valid).ok();
+        });
+    }
+
+    #[test]
+    fn send_summary_subprocess_check() {
+        if std::env::var("XDG_CONFIG_HOME").is_err() {
+            eprintln!("SKIP: not invoked via subprocess");
+            return;
+        }
+        let valid = PathBuf::from("/tmp/webox-test-summary-valid.txt");
+        let invalid = PathBuf::from("/tmp/ce4a7b93-e132-4959-8192-b9ad54c135b0-nonexistent.txt");
+        cmd_send(&[valid, invalid]).ok();
     }
 
     #[test]
